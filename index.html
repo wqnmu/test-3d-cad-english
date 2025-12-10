@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>3D CAD Editor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; font-family: sans-serif; }
+    .icon { width: 16px; height: 16px; display: inline-block; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    // アプリケーション全体の状態
+    let scene, camera, renderer, raycaster;
+    let objects = [];
+    let selectedObject = null;
+    let history = [];
+    let historyIndex = -1;
+    let snapToGrid = true;
+    let gridSize = 0.5;
+    let showColorPicker = false;
+    let showSizeInput = false;
+
+    // 初期化
+    function init() {
+      // シーン作成
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf0f0f0);
+
+      // Camera作成
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(10, 10, 10);
+      camera.lookAt(0, 0, 0);
+
+      // レンダラー作成
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.getElementById('viewport').appendChild(renderer.domElement);
+
+      // Grid
+      const gridHelper = new THREE.GridHelper(20, 20);
+      scene.add(gridHelper);
+
+      // ライト
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.6);
+      directionalLight.position.set(10, 10, 5);
+      scene.add(directionalLight);
+
+      // レイキャスター
+      raycaster = new THREE.Raycaster();
+
+      // イベントリスナー
+      setupEventListeners();
+
+      // アニメーション開始
+      animate();
+
+      // UI更新
+      updateUI();
+    }
+
+    // イベントリスナー設定
+    function setupEventListeners() {
+      let isDragging = false;
+      let previousMouse = { x: 0, y: 0 };
+      let mouse = { x: 0, y: 0 };
+      let lastTapTime = 0;
+      let initialPinchDistance = 0;
+
+      // マウスイベント
+      renderer.domElement.addEventListener('mousedown', (e) => {
+        if (e.button === 2 || e.ctrlKey) {
+          isDragging = true;
+          previousMouse = { x: e.clientX, y: e.clientY };
+        }
+      });
+
+      renderer.domElement.addEventListener('mousemove', (e) => {
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        if (isDragging) {
+          const deltaX = e.clientX - previousMouse.x;
+          const deltaY = e.clientY - previousMouse.y;
+          const radius = camera.position.length();
+          const theta = Math.atan2(camera.position.x, camera.position.z);
+          const phi = Math.acos(camera.position.y / radius);
+          const newTheta = theta - deltaX * 0.005;
+          const newPhi = Math.max(0.1, Math.min(Math.PI - 0.1, phi + deltaY * 0.005));
+          camera.position.x = radius * Math.sin(newPhi) * Math.sin(newTheta);
+          camera.position.y = radius * Math.cos(newPhi);
+          camera.position.z = radius * Math.sin(newPhi) * Math.cos(newTheta);
+          camera.lookAt(0, 0, 0);
+          previousMouse = { x: e.clientX, y: e.clientY };
+        }
+      });
+
+      renderer.domElement.addEventListener('mouseup', () => { isDragging = false; });
+
+      renderer.domElement.addEventListener('click', (e) => {
+        if (!isDragging) {
+          const rect = renderer.domElement.getBoundingClientRect();
+          mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          raycaster.setFromCamera(mouse, camera);
+          const intersects = raycaster.intersectObjects(objects);
+          selectedObject = intersects.length > 0 ? intersects[0].object : null;
+          updateUI();
+        }
+      });
+
+      renderer.domElement.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const direction = new THREE.Vector3();
+        camera.getWorldDirection(direction);
+        camera.position.addScaledVector(direction, -e.deltaY * 0.01);
+      });
+
+      renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+
+      // タッチイベント
+      renderer.domElement.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 1) {
+          const touch = e.touches[0];
+          previousMouse = { x: touch.clientX, y: touch.clientY };
+          const currentTime = Date.now();
+          if (currentTime - lastTapTime < 300) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((touch.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(objects);
+            selectedObject = intersects.length > 0 ? intersects[0].object : null;
+            updateUI();
+          }
+          lastTapTime = currentTime;
+        } else if (e.touches.length === 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          initialPinchDistance = Math.sqrt(dx * dx + dy * dy);
+        }
+      }, { passive: false });
+
+      renderer.domElement.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        if (e.touches.length === 1) {
+          const touch = e.touches[0];
+          const deltaX = touch.clientX - previousMouse.x;
+          const deltaY = touch.clientY - previousMouse.y;
+          const radius = camera.position.length();
+          const theta = Math.atan2(camera.position.x, camera.position.z);
+          const phi = Math.acos(camera.position.y / radius);
+          const newTheta = theta - deltaX * 0.005;
+          const newPhi = Math.max(0.1, Math.min(Math.PI - 0.1, phi + deltaY * 0.005));
+          camera.position.x = radius * Math.sin(newPhi) * Math.sin(newTheta);
+          camera.position.y = radius * Math.cos(newPhi);
+          camera.position.z = radius * Math.sin(newPhi) * Math.cos(newTheta);
+          camera.lookAt(0, 0, 0);
+          previousMouse = { x: touch.clientX, y: touch.clientY };
+        } else if (e.touches.length === 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          if (initialPinchDistance > 0) {
+            const direction = new THREE.Vector3();
+            camera.getWorldDirection(direction);
+            camera.position.addScaledVector(direction, (initialPinchDistance - distance) * 0.05);
+          }
+          initialPinchDistance = distance;
+        }
+      }, { passive: false });
+
+      renderer.domElement.addEventListener('touchend', () => { initialPinchDistance = 0; });
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // キーボード
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Delete' && selectedObject) deleteSelected();
+        else if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); }
+        else if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo(); }
+        else if (e.ctrlKey && e.key === 'd' && selectedObject) { e.preventDefault(); duplicateSelected(); }
+      });
+    }
+
+    // アニメーション
+    function animate() {
+      requestAnimationFrame(animate);
+      objects.forEach(obj => {
+        obj.material.emissive.setHex(obj === selectedObject ? 0x444444 : 0x000000);
+      });
+      renderer.render(scene, camera);
+    }
+
+    // 形状追加
+    function addShape(type) {
+      let geometry;
+      switch (type) {
+        case 'box': geometry = new THREE.BoxGeometry(2, 2, 2); break;
+        case 'sphere': geometry = new THREE.SphereGeometry(1, 32, 32); break;
+        case 'cylinder': geometry = new THREE.CylinderGeometry(1, 1, 2, 32); break;
+        case 'cone': geometry = new THREE.ConeGeometry(1, 2, 32); break;
+        case 'torus': geometry = new THREE.TorusGeometry(1, 0.4, 16, 100); break;
+        case 'plane': geometry = new THREE.PlaneGeometry(2, 2); break;
+      }
+      const material = new THREE.MeshPhongMaterial({ color: Math.random() * 0xffffff, emissive: 0 });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.y = 1;
+      scene.add(mesh);
+      objects.push(mesh);
+      selectedObject = mesh;
+      saveState();
+      updateUI();
+    }
+
+    // 変形
+    function transformObject(type, value) {
+      if (!selectedObject) return;
+      const snap = (v) => snapToGrid ? Math.round(v / gridSize) * gridSize : v;
+      switch (type) {
+        case 'moveX': selectedObject.position.x = snap(selectedObject.position.x + value); break;
+        case 'moveY': selectedObject.position.y = snap(selectedObject.position.y + value); break;
+        case 'moveZ': selectedObject.position.z = snap(selectedObject.position.z + value); break;
+        case 'rotateX': selectedObject.rotation.x += value; break;
+        case 'rotateY': selectedObject.rotation.y += value; break;
+        case 'rotateZ': selectedObject.rotation.z += value; break;
+        case 'scaleX': selectedObject.scale.x *= value; break;
+        case 'scaleY': selectedObject.scale.y *= value; break;
+        case 'scaleZ': selectedObject.scale.z *= value; break;
+        case 'scaleAll': selectedObject.scale.multiplyScalar(value); break;
+      }
+      saveState();
+    }
+
+    // Delete
+    function deleteSelected() {
+      if (!selectedObject) return;
+      scene.remove(selectedObject);
+      objects = objects.filter(o => o !== selectedObject);
+      selectedObject = null;
+      saveState();
+      updateUI();
+    }
+
+    // Duplicate
+    function duplicateSelected() {
+      if (!selectedObject) return;
+      const geom = selectedObject.geometry.clone();
+      const mat = new THREE.MeshPhongMaterial({ color: selectedObject.material.color.getHex(), emissive: 0 });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.copy(selectedObject.position);
+      mesh.position.x += 2;
+      mesh.rotation.copy(selectedObject.rotation);
+      mesh.scale.copy(selectedObject.scale);
+      scene.add(mesh);
+      objects.push(mesh);
+      selectedObject = mesh;
+      saveState();
+      updateUI();
+    }
+
+    // Color変更
+    function changeColor(color) {
+      if (!selectedObject) return;
+      selectedObject.material.color.setHex(parseInt(color.replace('#', '0x')));
+      showColorPicker = false;
+      saveState();
+      updateUI();
+    }
+
+    // SizeApply
+    function applySize() {
+      if (!selectedObject) return;
+      const x = parseFloat(document.getElementById('sizeX').value);
+      const y = parseFloat(document.getElementById('sizeY').value);
+      const z = parseFloat(document.getElementById('sizeZ').value);
+      if (!isNaN(x) && x > 0) selectedObject.scale.x = x / 2;
+      if (!isNaN(y) && y > 0) selectedObject.scale.y = y / 2;
+      if (!isNaN(z) && z > 0) selectedObject.scale.z = z / 2;
+      showSizeInput = false;
+      saveState();
+      updateUI();
+    }
+
+    // 履歴
+    function saveState() {
+      const state = objects.map(o => ({
+        type: o.geometry.type,
+        position: o.position.clone(),
+        rotation: o.rotation.clone(),
+        scale: o.scale.clone(),
+        color: o.material.color.getHex()
+      }));
+      history = history.slice(0, historyIndex + 1);
+      history.push(state);
+      historyIndex = history.length - 1;
+      updateUI();
+    }
+
+    function undo() {
+      if (historyIndex > 0) {
+        historyIndex--;
+        restoreState(history[historyIndex]);
+      }
+    }
+
+    function redo() {
+      if (historyIndex < history.length - 1) {
+        historyIndex++;
+        restoreState(history[historyIndex]);
+      }
+    }
+
+    function restoreState(state) {
+      objects.forEach(o => scene.remove(o));
+      objects = [];
+      state.forEach(d => {
+        let geom;
+        switch (d.type) {
+          case 'BoxGeometry': geom = new THREE.BoxGeometry(2, 2, 2); break;
+          case 'SphereGeometry': geom = new THREE.SphereGeometry(1, 32, 32); break;
+          case 'CylinderGeometry': geom = new THREE.CylinderGeometry(1, 1, 2, 32); break;
+          case 'ConeGeometry': geom = new THREE.ConeGeometry(1, 2, 32); break;
+          case 'TorusGeometry': geom = new THREE.TorusGeometry(1, 0.4, 16, 100); break;
+          case 'PlaneGeometry': geom = new THREE.PlaneGeometry(2, 2); break;
+        }
+        const mat = new THREE.MeshPhongMaterial({ color: d.color, emissive: 0 });
+        const mesh = new THREE.Mesh(geom, mat);
+        mesh.position.copy(d.position);
+        mesh.rotation.copy(d.rotation);
+        mesh.scale.copy(d.scale);
+        scene.add(mesh);
+        objects.push(mesh);
+      });
+      selectedObject = null;
+      updateUI();
+    }
+
+    // エクスポート/インポート
+    function exportScene() {
+      const data = objects.map(o => ({
+        type: o.geometry.type,
+        position: [o.position.x, o.position.y, o.position.z],
+        rotation: [o.rotation.x, o.rotation.y, o.rotation.z],
+        scale: [o.scale.x, o.scale.y, o.scale.z],
+        color: '#' + o.material.color.getHexString()
+      }));
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'scene.json';
+      a.click();
+    }
+
+    function importScene() {
+      const input = document.getElementById('importFile');
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = JSON.parse(e.target.result);
+          objects.forEach(o => scene.remove(o));
+          objects = [];
+          data.forEach(d => {
+            let geom;
+            switch (d.type) {
+              case 'BoxGeometry': geom = new THREE.BoxGeometry(2, 2, 2); break;
+              case 'SphereGeometry': geom = new THREE.SphereGeometry(1, 32, 32); break;
+              case 'CylinderGeometry': geom = new THREE.CylinderGeometry(1, 1, 2, 32); break;
+              case 'ConeGeometry': geom = new THREE.ConeGeometry(1, 2, 32); break;
+              case 'TorusGeometry': geom = new THREE.TorusGeometry(1, 0.4, 16, 100); break;
+              case 'PlaneGeometry': geom = new THREE.PlaneGeometry(2, 2); break;
+            }
+            const mat = new THREE.MeshPhongMaterial({ color: d.color, emissive: 0 });
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.position.set(...d.position);
+            mesh.rotation.set(...d.rotation);
+            mesh.scale.set(...d.scale);
+            scene.add(mesh);
+            objects.push(mesh);
+          });
+          saveState();
+        } catch { alert('Load failed'); }
+      };
+      reader.readAsText(file);
+    }
+
+    // UI更新
+    function updateUI() {
+      const toolbar = document.getElementById('toolbar');
+      const selected = selectedObject !== null;
+      
+      let html = `
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px;">
+          <div style="display: flex; gap: 4px; border-right: 1px solid #ddd; padding-right: 8px;">
+            <button onclick="addShape('box')" class="btn-blue">Cube</button>
+            <button onclick="addShape('sphere')" class="btn-blue">Sphere</button>
+            <button onclick="addShape('cylinder')" class="btn-blue">Cylinder</button>
+            <button onclick="addShape('cone')" class="btn-blue">Cone</button>
+            <button onclick="addShape('torus')" class="btn-blue">Torus</button>
+            <button onclick="addShape('plane')" class="btn-blue">Plane</button>
+          </div>
+          <div style="display: flex; gap: 4px; border-right: 1px solid #ddd; padding-right: 8px;">
+            <button onclick="undo()" ${historyIndex <= 0 ? 'disabled' : ''} class="btn-gray">↶ Undo</button>
+            <button onclick="redo()" ${historyIndex >= history.length - 1 ? 'disabled' : ''} class="btn-gray">↷ Redo</button>
+          </div>
+          <div style="display: flex; gap: 4px; border-right: 1px solid #ddd; padding-right: 8px;">
+            <button onclick="exportScene()" class="btn-green">💾 Save</button>
+            <label class="btn-blue" style="cursor: pointer;">📂 Load<input type="file" id="importFile" accept=".json" onchange="importScene()" style="display:none"></label>
+          </div>
+          <div style="display: flex; gap: 4px; border-right: 1px solid #ddd; padding-right: 8px;">
+            <button onclick="snapToGrid = !snapToGrid; updateUI()" class="${snapToGrid ? 'btn-purple' : 'btn-gray'}">
+              Grid ${snapToGrid ? 'ON' : 'OFF'}
+            </button>
+          </div>
+      `;
+
+      if (selected) {
+        html += `
+          <div style="display: flex; gap: 4px; border-right: 1px solid #ddd; padding-right: 8px;">
+            <button onclick="duplicateSelected()" class="btn-orange">📋 Duplicate</button>
+            <button onclick="showColorPicker = !showColorPicker; updateUI()" class="btn-pink">🎨 Color</button>
+            <button onclick="showSizeInput = !showSizeInput; if(showSizeInput) updateSizeInputs(); updateUI()" class="btn-teal">📐 Size</button>
+            <button onclick="deleteSelected()" class="btn-red">🗑️ Delete</button>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <div>
+              <div style="font-weight: bold; margin-bottom: 2px;">Move</div>
+              <button onclick="transformObject('moveX', -${gridSize})" class="btn-sm btn-red">X-</button>
+              <button onclick="transformObject('moveX', ${gridSize})" class="btn-sm btn-red">X+</button>
+              <button onclick="transformObject('moveY', -${gridSize})" class="btn-sm" style="background: #22c55e; color: white;">Y-</button>
+              <button onclick="transformObject('moveY', ${gridSize})" class="btn-sm" style="background: #22c55e; color: white;">Y+</button>
+              <button onclick="transformObject('moveZ', -${gridSize})" class="btn-sm btn-blue">Z-</button>
+              <button onclick="transformObject('moveZ', ${gridSize})" class="btn-sm btn-blue">Z+</button>
+            </div>
+            <div>
+              <div style="font-weight: bold; margin-bottom: 2px;">Rotate</div>
+              <button onclick="transformObject('rotateX', Math.PI / 12)" class="btn-sm" style="background: #f97316; color: white;">X</button>
+              <button onclick="transformObject('rotateY', Math.PI / 12)" class="btn-sm" style="background: #f97316; color: white;">Y</button>
+              <button onclick="transformObject('rotateZ', Math.PI / 12)" class="btn-sm" style="background: #f97316; color: white;">Z</button>
+            </div>
+            <div>
+              <div style="font-weight: bold; margin-bottom: 2px;">Scale</div>
+              <button onclick="transformObject('scaleAll', 1.1)" class="btn-sm btn-purple">+</button>
+              <button onclick="transformObject('scaleAll', 0.9)" class="btn-sm btn-purple">-</button>
+              <button onclick="transformObject('scaleX', 1.1)" class="btn-sm" style="background: #a78bfa; color: white; font-size: 9px;">X+</button>
+              <button onclick="transformObject('scaleY', 1.1)" class="btn-sm" style="background: #a78bfa; color: white; font-size: 9px;">Y+</button>
+              <button onclick="transformObject('scaleZ', 1.1)" class="btn-sm" style="background: #a78bfa; color: white; font-size: 9px;">Z+</button>
+            </div>
+          </div>
+        `;
+      }
+
+      html += '</div>';
+      toolbar.innerHTML = html;
+
+      // カラーピッカー
+      const colorPickerDiv = document.getElementById('colorPicker');
+      if (showColorPicker && selected) {
+        const colors = ['#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
+                       '#FF8800', '#88FF00', '#0088FF', '#FF0088', '#8800FF', '#00FF88',
+                       '#FFFFFF', '#CCCCCC', '#888888', '#444444', '#000000', '#FFB6C1'];
+        let colorHtml = '<div style="position: absolute; top: 60px; right: 16px; background: white; padding: 16px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index: 10;">';
+        colorHtml += '<p style="font-weight: bold; margin-bottom: 8px;">ColorをSelect</p>';
+        colorHtml += '<div style="display: grid; grid-template-columns: repeat(6, 32px); gap: 8px;">';
+        colors.forEach(color => {
+          colorHtml += `<button onclick="changeColor('${color}')" style="width: 32px; height: 32px; background: ${color}; border: 2px solid #ddd; border-radius: 4px; cursor: pointer;"></button>`;
+        });
+        colorHtml += '</div>';
+        colorHtml += '<button onclick="showColorPicker = false; updateUI()" style="margin-top: 8px; width: 100%; padding: 4px; background: #e5e7eb; border: none; border-radius: 4px; cursor: pointer;">Close</button>';
+        colorHtml += '</div>';
+        colorPickerDiv.innerHTML = colorHtml;
+      } else {
+        colorPickerDiv.innerHTML = '';
+      }
+
+      // Size入力
+      const sizeInputDiv = document.getElementById('sizeInput');
+      if (showSizeInput && selected) {
+        let sizeHtml = '<div style="position: absolute; top: 60px; right: 16px; background: white; padding: 16px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index: 10;">';
+        sizeHtml += '<p style="font-weight: bold; margin-bottom: 12px;">Sizeを入力</p>';
+        sizeHtml += '<div style="display: flex; flex-direction: column; gap: 8px;">';
+        sizeHtml += '<div style="display: flex; align-items: center; gap: 8px;"><label style="width: 32px; font-weight: bold; color: #ef4444;">X:</label><input type="number" id="sizeX" style="border: 1px solid #ddd; border-radius: 4px; padding: 4px 8px; width: 80px;" step="0.1" min="0.1"></div>';
+        sizeHtml += '<div style="display: flex; align-items: center; gap: 8px;"><label style="width: 32px; font-weight: bold; color: #22c55e;">Y:</label><input type="number" id="sizeY" style="border: 1px solid #ddd; border-radius: 4px; padding: 4px 8px; width: 80px;" step="0.1" min="0.1"></div>';
+        sizeHtml += '<div style="display: flex; align-items: center; gap: 8px;"><label style="width: 32px; font-weight: bold; color: #3b82f6;">Z:</label><input type="number" id="sizeZ" style="border: 1px solid #ddd; border-radius: 4px; padding: 4px 8px; width: 80px;" step="0.1" min="0.1"></div>';
+        sizeHtml += '</div>';
+        sizeHtml += '<div style="display: flex; gap: 8px; margin-top: 12px;">';
+        sizeHtml += '<button onclick="applySize()" style="flex: 1; padding: 4px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer;">Apply</button>';
+        sizeHtml += '<button onclick="showSizeInput = false; updateUI()" style="flex: 1; padding: 4px; background: #e5e7eb; border: none; border-radius: 4px; cursor: pointer;">Close</button>';
+        sizeHtml += '</div></div>';
+        sizeInputDiv.innerHTML = sizeHtml;
+        updateSizeInputs();
+      } else {
+        sizeInputDiv.innerHTML = '';
+      }
+    }
+
+    function updateSizeInputs() {
+      if (selectedObject) {
+        setTimeout(() => {
+          document.getElementById('sizeX').value = (selectedObject.scale.x * 2).toFixed(2);
+          document.getElementById('sizeY').value = (selectedObject.scale.y * 2).toFixed(2);
+          document.getElementById('sizeZ').value = (selectedObject.scale.z * 2).toFixed(2);
+        }, 10);
+      }
+    }
+
+    // ページロード時に初期化
+    window.onload = init;
+  </script>
+
+  <style>
+    .btn-blue { padding: 4px 8px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-blue:hover { background: #2563eb; }
+    .btn-gray { padding: 4px 8px; background: #e5e7eb; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-gray:hover { background: #d1d5db; }
+    .btn-gray:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-green { padding: 4px 8px; background: #22c55e; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-green:hover { background: #16a34a; }
+    .btn-orange { padding: 4px 8px; background: #f97316; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-orange:hover { background: #ea580c; }
+    .btn-pink { padding: 4px 8px; background: #ec4899; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-pink:hover { background: #db2777; }
+    .btn-teal { padding: 4px 8px; background: #14b8a6; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-teal:hover { background: #0d9488; }
+    .btn-red { padding: 4px 8px; background: #ef4444; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-red:hover { background: #dc2626; }
+    .btn-purple { padding: 4px 8px; background: #a855f7; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-purple:hover { background: #9333ea; }
+    .btn-sm { padding: 2px 4px; border: none; border-radius: 4px; cursor: pointer; font-size: 10px; }
+  </style>
+
+  <div style="display: flex; flex-direction: column; height: 100vh;">
+    <div id="toolbar" style="background: white; padding: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-bottom: 1px solid #e5e7eb;"></div>
+    <div id="colorPicker"></div>
+    <div id="sizeInput"></div>
+    <div style="flex: 1; position: relative;">
+      <div id="viewport" style="width: 100%; height: 100%;"></div>
+      <div style="position: absolute; bottom: 16px; left: 16px; background: rgba(255,255,255,0.95); padding: 12px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); font-size: 12px;">
+        <p style="font-weight: bold; margin-bottom: 4px;">📋 How to Use</p>
+        <p>• <strong>Camera:</strong> 右クリック/1指ドラッグでRotate、ホイール/2指ピンチでズーム</p>
+        <p>• <strong>Select:</strong> Click/Double-tap</p>
+        <p>• <strong>Keyboard:</strong> Delete=Delete, Ctrl+Z=Undo, Ctrl+Y=Redo, Ctrl+D=Duplicate</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
